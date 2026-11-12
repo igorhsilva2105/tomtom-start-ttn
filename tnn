@@ -1,0 +1,264 @@
+#!/bin/sh
+# Launcher v10: tela inicial com os aplicativos da pasta apps/.
+#   apps/NOME.sh        script principal do aplicativo
+#   apps/NOME/          pasta do aplicativo (arquivos dele); apps/NOME/icon.raw = icone 80x80, RGB565 (12800 bytes)
+#   data/appList.txt    lista gerada por este launcher a cada inicializacao
+# O unico icone fixo e "ORIGINAL" (menu original da TomTom). Sem toque por 60 s, ou com o cabo num PC,
+# abre o original (ele cuida do USB, do desligar e da bateria).
+
+SD=${SD:-/mnt/sdcard}
+FB=${FB:-/dev/fb}
+EV=${EV:-/dev/input/event0}
+FSYS=${FSYS:-/sys/class/graphics/fb0}
+APPS=$SD/apps
+DATA=$SD/data
+OUT=$SD/launcher_log
+IDLE=${IDLE:-60}
+BUSYIDLE=300
+OLDIFS=$IFS
+
+mkdir -p $OUT $APPS $DATA/cache/icons
+echo "inicio $(date)" > $OUT/log.txt
+rm -f /tmp/busy /tmp/act /tmp/appid /tmp/apppids
+log() { echo "$1" >> $OUT/log.txt; }
+
+go_original() {
+  echo "0,0" > $FSYS/pan 2> /dev/null
+  sync
+  exec $SD/PNDNavigator
+}
+
+# arquivos essenciais do launcher; se faltar algum, abre o original na hora
+FALTA=""
+for f in home.awk bar.rows icon_original.rows icon_default.rows lib.sh; do
+  if [ ! -f $DATA/$f ]; then
+    FALTA="$FALTA $f"
+  fi
+done
+log "arquivos essenciais faltando:$FALTA"
+case "$FALTA" in ?*) go_original ;; esac
+
+# decodificador dos eventos de toque (calibrado nos testes 3 e 4)
+cat > /tmp/decode.awk <<'AWK'
+function h(s,  i,n,c){n=0;s=tolower(s);for(i=1;i<=length(s);i++){c=index("0123456789abcdef",substr(s,i,1))-1;n=n*16+c}return n}
+NF>=9 { t=h($6); c=h($7); v=h($8)+65536*h($9);
+  if(t==3&&c==0) x=v; else if(t==3&&c==1) y=v;
+  else if(t==0&&c==0&&x!=""&&y!="") {n++; X[n]=x; Y[n]=y}
+}
+END {
+  if(n==0){print "0 0 0 0 0 0"; exit}
+  a=1;b=n; if(n>6){a=3;b=n-2}
+  sx=0;sy=0;m=0; for(i=a;i<=b;i++){sx+=X[i];sy+=Y[i];m++}
+  rx=sx/m; ry=sy/m
+  px=16+(919-rx)*448/822; py=16+(855-ry)*240/707
+  if(px<0)px=0; if(px>479)px=479; if(py<0)py=0; if(py>271)py=271
+  printf "%d %d %d %d %d %d\n", 0, px, py, rx, ry, n
+}
+AWK
+
+size() { set -- $(wc -c < /tmp/ev.log); echo $1; }
+
+# encerra o aplicativo e todos os processos que ele registrou (a biblioteca lib.sh grava o PID em /tmp/apppids)
+killapps() {
+  if [ -f /tmp/appid ]; then
+    kill $(cat /tmp/appid) 2> /dev/null
+  fi
+  if [ -f /tmp/apppids ]; then
+    kill $(cat /tmp/apppids) 2> /dev/null
+  fi
+}
+
+# ---------------------------------------------------------------- 1. descobre os aplicativos e grava data/appList.txt
+scan_apps() {
+  ls -l "$APPS" > /tmp/ls_apps.txt 2>&1
+  ls -l "$APPS"/*/icon.raw > /tmp/ls_icons.txt 2>&1
+  awk -v apps="$APPS" '
+    function rest(  t){ t=$0; sub(/^[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +/,"",t); return t }
+    FNR==NR { if(NF>=9 && $1 ~ /^-/){ nm=rest(); if(nm ~ /\.sh$/){ sub(/\.sh$/,"",nm); sh[nm]=1 } } next }
+    { if(NF>=9 && $1 ~ /^-/){ p=rest(); sub(apps "/","",p); sub(/\/icon\.raw$/,"",p); isz[p]=$5; st[p]=$6 "_" $7 "_" $8 } }
+    END{ for(n in sh){ s=(n in isz)?isz[n]:0; t=(n in isz)?st[n]:"-"; print n "|" apps "/" n ".sh|" apps "/" n "/icon.raw|" s "|" t } }
+  ' /tmp/ls_apps.txt /tmp/ls_icons.txt | sort > /tmp/appList.new
+  { echo "# nome|script|icone|tamanho_do_icone|carimbo_do_icone  (gerado pelo ttn a cada inicializacao)"; cat /tmp/appList.new; } > /tmp/appList.out
+  if cmp /tmp/appList.out $DATA/appList.txt > /dev/null 2>&1; then
+    log "appList.txt sem mudancas"
+  else
+    cp /tmp/appList.out $DATA/appList.txt
+    sync
+    log "appList.txt atualizado"
+  fi
+}
+
+# ---------------------------------------------------------------- 2. converte os icones (so quando mudam) e monta a lista da tela inicial
+prepare_entries() {
+  echo "ORIGINAL|$DATA/icon_original.rows|ORIGINAL|" > /tmp/home_entries.txt
+  while read LINE; do
+    case "$LINE" in '#'*|'') continue ;; esac
+    IFS='|'; set -- $LINE; IFS=$OLDIFS
+    NAME=$1; SCRIPT=$2; ICON=$3; ISZ=$4; STAMP=$5
+    ROWS=$DATA/icon_default.rows
+    case "$ISZ" in
+      12800)
+        CK=$DATA/cache/icons/$NAME
+        OLD=""
+        read OLD < $CK.stamp 2> /dev/null
+        case "$OLD" in
+          "$ISZ|$STAMP") ROWS=$CK.rows ;;
+          *)
+            hexdump -v -e '160/1 "%u " "\n"' "$ICON" 2> /dev/null | awk '{ s=""; for(i=1;i<=NF;i++){ v=$i; if(v==0) v=1; else if(v==10) v=11; s=s sprintf("%c",v) } print s }' > $CK.rows.tmp
+            set -- $(wc -l < $CK.rows.tmp)
+            case "$1" in
+              80) mv $CK.rows.tmp $CK.rows; echo "$ISZ|$STAMP" > $CK.stamp; ROWS=$CK.rows; log "icone convertido: $NAME" ;;
+              *) rm -f $CK.rows.tmp; log "icone invalido (a conversao falhou): $NAME" ;;
+            esac ;;
+        esac ;;
+      0) ;;
+      *) log "icone com tamanho errado ($ISZ bytes, o certo e 12800): $NAME" ;;
+    esac
+    echo "$NAME|$ROWS|$SCRIPT|$NAME" >> /tmp/home_entries.txt
+  done < /tmp/appList.new
+}
+
+# ---------------------------------------------------------------- 3. monta as paginas da tela inicial (em memoria)
+compose_pages() {
+  set -- $(wc -l < /tmp/home_entries.txt)
+  NENT=$1
+  NPAGES=$(( (NENT + 7) / 8 ))
+  p=0
+  while :; do
+    case $p in $NPAGES) break ;; esac
+    awk -v page=$p -v pages=$NPAGES -v barfile=$DATA/bar.rows -f $DATA/home.awk /tmp/home_entries.txt > /tmp/home_$p.raw
+    set -- $(wc -c < /tmp/home_$p.raw)
+    case "$1" in 261120) ;; *) log "pagina $p com tamanho errado ($1); abrindo o original"; go_original ;; esac
+    p=$((p + 1))
+  done
+}
+
+read T0 _ < /proc/uptime
+scan_apps
+prepare_entries
+compose_pages
+read T1 _ < /proc/uptime
+log "aplicativos encontrados: $((NENT - 1)); paginas: $NPAGES; preparo de $T0 a $T1 (uptime)"
+
+# ---------------------------------------------------------------- 4. toque
+lw_tap() {
+  while :; do
+    case "$SIM" in
+      ?*) read SX SY <&3 || exit 0; : > /tmp/act; break ;;
+    esac
+    S0=$(size)
+    dd if=$EV of=/dev/null bs=16 count=1 2> /dev/null
+    : > /tmp/act
+    prev=-1; same=0
+    while :; do
+      cur=$(size)
+      case $cur in $prev) same=$((same + 1)) ;; *) same=0 ;; esac
+      prev=$cur
+      case $same in 4) break ;; esac
+    done
+    S1=$prev
+    R=$(dd if=/tmp/ev.log bs=16 skip=$((S0 / 16)) count=$(((S1 - S0) / 16)) 2> /dev/null | hexdump -v | awk -f /tmp/decode.awk)
+    set -- $R
+    case "$6" in 0) continue ;; esac
+    SX=$2; SY=$3
+    break
+  done
+}
+
+run_app() { # $1 = script, $2 = nome
+  APPDIR=$APPS/$2
+  export APPDIR DATA SD
+  : > /tmp/busy
+  rm -f /tmp/apppids
+  sh "$1" &
+  echo $! > /tmp/appid
+  wait $!
+  rm -f /tmp/appid /tmp/apppids /tmp/busy
+  : > /tmp/act
+  log "app encerrado: $2 $(date)"
+}
+
+loop() {
+  : > /tmp/ev.log
+  cat $EV >> /tmp/ev.log 2> $OUT/ev_erro.txt &
+  CATPID=$!
+  PAGE=0
+  cat /tmp/home_$PAGE.raw > $FB
+  while true; do
+    lw_tap
+    case $((SY >= 224)) in
+      1)
+        case $((SX < 120)) in
+          1) case $((PAGE > 0)) in 1) PAGE=$((PAGE - 1)); cat /tmp/home_$PAGE.raw > $FB ;; esac ;;
+        esac
+        case $((SX >= 360)) in
+          1) case $((PAGE + 1 < NPAGES)) in 1) PAGE=$((PAGE + 1)); cat /tmp/home_$PAGE.raw > $FB ;; esac ;;
+        esac ;;
+      *)
+        IDX=$((PAGE * 8 + (SY / 112) * 4 + SX / 120 + 1))
+        case $((IDX <= NENT)) in
+          1)
+            SCRIPT=$(awk -F'|' -v n=$IDX 'NR==n{print $3}' /tmp/home_entries.txt)
+            ANAME=$(awk -F'|' -v n=$IDX 'NR==n{print $4}' /tmp/home_entries.txt)
+            echo "$(date) toque ($SX,$SY) item $IDX: $ANAME $SCRIPT" >> $OUT/taps.txt
+            case "$SCRIPT" in
+              ORIGINAL) break ;;
+              *) run_app "$SCRIPT" "$ANAME"; cat /tmp/home_$PAGE.raw > $FB ;;
+            esac ;;
+        esac ;;
+    esac
+  done
+  kill $CATPID 2> /dev/null
+}
+
+rm -f $OUT/taps.txt
+loop &
+LP=$!
+
+# vigia: sem toque por $IDLE s (ou $BUSYIDLE s dentro de um aplicativo), ou com o cabo num PC, abre o original
+(
+  i=0
+  b=0
+  while [ $i -lt $IDLE ]; do
+    sleep 1
+    if [ -f /tmp/busy ]; then
+      if [ -f /tmp/act ]; then
+        rm -f /tmp/act
+        b=0
+      else
+        b=$(expr $b + 1)
+      fi
+      i=0
+      if [ $b -ge $BUSYIDLE ]; then
+        i=$IDLE
+      fi
+    elif [ -f /tmp/act ]; then
+      rm -f /tmp/act
+      i=0
+      b=0
+    else
+      i=$(expr $i + 1)
+      b=0
+    fi
+    # cabo ligado a um PC (estado USB_STATE_DEVICE): entrega para o original, que faz o disco aparecer no PC
+    if [ ! -f /tmp/busy ]; then
+      ULAST=$(dmesg | grep "usbmode:\[" | tail -1)
+      case "$ULAST" in
+        *"==> USB_STATE_DEVICE") i=$IDLE ;;
+      esac
+    fi
+  done
+  echo "vigia encerrou a tela inicial: i=$i b=$b ULAST=$ULAST $(date)" >> $OUT/log.txt
+  killapps
+  kill $LP 2> /dev/null
+) &
+WD=$!
+
+wait $LP
+kill $WD 2> /dev/null
+killapps
+killall dd 2> /dev/null
+killall cat 2> /dev/null
+rm -f /tmp/busy /tmp/act /tmp/appid /tmp/apppids
+log "fim $(date)"
+go_original
