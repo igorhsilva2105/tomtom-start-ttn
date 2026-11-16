@@ -1,42 +1,148 @@
 #!/bin/sh
-# Launcher v10: tela inicial com os aplicativos da pasta apps/.
+# Launcher v11: tela inicial com os aplicativos da pasta apps/.
 #   apps/NOME.sh        script principal do aplicativo
-#   apps/NOME/          pasta do aplicativo (arquivos dele); apps/NOME/icon.raw = icone 80x80, RGB565 (12800 bytes)
+#   apps/NOME/          pasta do aplicativo; apps/NOME/icon.raw = icone 80x80 RGB565 (12800 bytes)
+#                       apps/NOME/icon.rows (opcional) = icone ja convertido no PC (12880 bytes)
 #   data/appList.txt    lista gerada por este launcher a cada inicializacao
-# O unico icone fixo e "ORIGINAL" (menu original da TomTom). Sem toque por 60 s, ou com o cabo num PC,
+#   data/config.txt     ajustes opcionais (IDLE, BUSYIDLE, PREPMAX, MAXAPPS, FASTTAP, DEBUG)
+# O unico icone fixo e "ORIGINAL" (menu original da TomTom). Sem toque por IDLE s, ou com o cabo num PC,
 # abre o original (ele cuida do USB, do desligar e da bateria).
+# Mudancas da v11 em relacao a v10: ver LEIAME.txt e a secao 10.11 do guia.
 
 SD=${SD:-/mnt/sdcard}
 FB=${FB:-/dev/fb}
 EV=${EV:-/dev/input/event0}
 FSYS=${FSYS:-/sys/class/graphics/fb0}
+BL=${BL:-/sys/class/backlight/s3c}
+USBSYS=${USBSYS:-/sys/devices/platform/tomtomgo-usbmode/mode}
 APPS=$SD/apps
 DATA=$SD/data
 OUT=$SD/launcher_log
 IDLE=${IDLE:-60}
 BUSYIDLE=300
+PREPMAX=90
+MAXAPPS=64
+FASTTAP=0
+DEBUG=0
 OLDIFS=$IFS
 
-mkdir -p $OUT $APPS $DATA/cache/icons
-echo "inicio $(date)" > $OUT/log.txt
-rm -f /tmp/busy /tmp/act /tmp/appid /tmp/apppids
-log() { echo "$1" >> $OUT/log.txt; }
+mkdir -p "$OUT" "$APPS" "$DATA/cache/icons"
 
-go_original() {
-  echo "0,0" > $FSYS/pan 2> /dev/null
-  sync
-  exec $SD/PNDNavigator
+# ---------------------------------------------------------------- registro (com rotacao: log.txt -> log.1 -> log.2 -> log.3)
+rm -f "$OUT/log.3"
+mv "$OUT/log.2" "$OUT/log.3" 2> /dev/null
+mv "$OUT/log.1" "$OUT/log.2" 2> /dev/null
+mv "$OUT/log.txt" "$OUT/log.1" 2> /dev/null
+# o relogio do aparelho esta errado (2001): os registros usam o tempo ligado (uptime) em segundos
+log() { read UPT UPR < /proc/uptime; echo "[$UPT] $1" >> "$OUT/log.txt"; }
+log "inicio launcher v11"
+rm -f /tmp/busy /tmp/act /tmp/appid /tmp/apppids /tmp/prep_vars /tmp/prep_ok
+
+# ---------------------------------------------------------------- encerrar processos (so os nossos, nunca killall)
+# imprime o PID $1 e todos os seus descendentes (le o PPID de /proc/PID/stat)
+tree_pids() {
+  awk -v root="$1" '
+    { pid=$1; s=$0; sub(/^[^)]*\) /,"",s); split(s,a," "); pp[pid]=a[2] }
+    END {
+      n=1; q[1]=root
+      for(i=1;i<=n;i++){ for(p in pp){ if(pp[p]==q[i]){ seen=0; for(j=1;j<=n;j++) if(q[j]==p) seen=1; if(!seen){ n++; q[n]=p } } } }
+      for(i=1;i<=n;i++) print q[i]
+    }' /proc/[0-9]*/stat 2> /dev/null
 }
 
-# arquivos essenciais do launcher; se faltar algum, abre o original na hora
+# encerra o processo $1 e seus filhos (nunca o PID 1 nem o proprio shell)
+killtree() {
+  KT=$1
+  case "$KT" in ''|*[!0-9]*) return 0 ;; esac
+  [ -d "/proc/$KT" ] || return 0
+  KL=$(tree_pids "$KT")
+  for kp in $KL; do
+    case "$kp" in 1|$$) continue ;; esac
+    kill "$kp" 2> /dev/null
+  done
+  milisleep 150 > /dev/null 2>&1
+  for kp in $KL; do
+    case "$kp" in 1|$$) continue ;; esac
+    [ -d "/proc/$kp" ] && kill -9 "$kp" 2> /dev/null
+  done
+  return 0
+}
+
+# PIDs registrados pela lib.sh (processos que o aplicativo soltou)
+killapps() {
+  if [ -f /tmp/appid ]; then
+    read KA < /tmp/appid
+    killtree "$KA"
+  fi
+  if [ -f /tmp/apppids ]; then
+    while read KA; do
+      case "$KA" in ''|*[!0-9]*) continue ;; esac
+      [ -d "/proc/$KA" ] && kill "$KA" 2> /dev/null
+    done < /tmp/apppids
+  fi
+}
+
+go_original() {
+  log "abrindo o original"
+  echo "0,0" > "$FSYS/pan" 2> /dev/null
+  rm -f "$DATA/boot_pending"
+  sync
+  if [ ! -x "$SD/PNDNavigator" ]; then
+    log "ATENCAO: PNDNavigator ausente ou sem permissao de execucao"
+  fi
+  exec "$SD/PNDNavigator"
+}
+
+# ---------------------------------------------------------------- modo seguro (se o boot anterior nao chegou a tela inicial)
+if [ -f "$DATA/boot_pending" ]; then
+  log "boot anterior nao terminou: modo seguro, abrindo o original"
+  go_original
+fi
+if [ -f "$DATA/safe.flag" ]; then
+  log "data/safe.flag existe: abrindo o original"
+  go_original
+fi
+: > "$DATA/boot_pending"
+sync
+
+# tela de carregamento (opcional)
+if [ -f "$DATA/splash.raw" ]; then
+  cat "$DATA/splash.raw" > "$FB" 2> /dev/null
+fi
+
+# ---------------------------------------------------------------- ajustes opcionais (somente linhas NOME=numero)
+if [ -f "$DATA/config.txt" ]; then
+  tr -d '\015' < "$DATA/config.txt" | awk '/^(IDLE|BUSYIDLE|PREPMAX|MAXAPPS|FASTTAP|DEBUG)=[0-9]+[ \t]*$/ { sub(/[ \t]+$/,""); print }' > /tmp/config.sh
+  . /tmp/config.sh
+fi
+case "$IDLE" in ''|*[!0-9]*) IDLE=60 ;; esac
+case "$BUSYIDLE" in ''|*[!0-9]*) BUSYIDLE=300 ;; esac
+case "$PREPMAX" in ''|*[!0-9]*) PREPMAX=90 ;; esac
+case "$MAXAPPS" in ''|*[!0-9]*) MAXAPPS=64 ;; esac
+[ "$IDLE" -lt 10 ] && IDLE=10
+[ "$BUSYIDLE" -lt 30 ] && BUSYIDLE=30
+[ "$PREPMAX" -lt 20 ] && PREPMAX=20
+[ "$MAXAPPS" -gt 64 ] && MAXAPPS=64
+[ "$MAXAPPS" -lt 1 ] && MAXAPPS=1
+log "ajustes: IDLE=$IDLE BUSYIDLE=$BUSYIDLE PREPMAX=$PREPMAX MAXAPPS=$MAXAPPS FASTTAP=$FASTTAP DEBUG=$DEBUG"
+
+# ---------------------------------------------------------------- pre-verificacao (se faltar algo essencial, abre o original na hora)
 FALTA=""
 for f in home.awk bar.rows icon_original.rows icon_default.rows lib.sh; do
-  if [ ! -f $DATA/$f ]; then
-    FALTA="$FALTA $f"
+  if [ ! -s "$DATA/$f" ]; then
+    FALTA="$FALTA data/$f"
   fi
 done
-log "arquivos essenciais faltando:$FALTA"
+[ -r "$EV" ] || FALTA="$FALTA $EV"
+[ -w "$FB" ] || FALTA="$FALTA $FB"
+: > /tmp/preflight.test 2> /dev/null || FALTA="$FALTA /tmp(gravacao)"
+rm -f /tmp/preflight.test
+log "pre-verificacao, faltando:$FALTA"
 case "$FALTA" in ?*) go_original ;; esac
+
+# brilho e pagina a restaurar depois de cada aplicativo
+ORIGBR=""
+if [ -r "$BL/brightness" ]; then read ORIGBR < "$BL/brightness"; fi
 
 # decodificador dos eventos de toque (calibrado nos testes 3 e 4)
 cat > /tmp/decode.awk <<'AWK'
@@ -56,98 +162,204 @@ END {
 }
 AWK
 
+# decodificador do PRIMEIRO pacote de um toque (4 eventos: X, Y, pressao > 0, SYN); outra coisa = descartado
+cat > /tmp/fast.awk <<'AWK'
+function h(s,  i,n,c){n=0;s=tolower(s);for(i=1;i<=length(s);i++){c=index("0123456789abcdef",substr(s,i,1))-1;n=n*16+c}return n}
+NF>=9 { k++; t[k]=h($6); c[k]=h($7); v[k]=h($8)+65536*h($9) }
+END {
+  if(k!=4 || t[1]!=3 || c[1]!=0 || t[2]!=3 || c[2]!=1 || t[3]!=3 || c[3]!=24 || v[3]<=0 || t[4]!=0 || c[4]!=0){ print "0 0 0 0 0 0"; exit }
+  rx=v[1]; ry=v[2]
+  px=16+(919-rx)*448/822; py=16+(855-ry)*240/707
+  if(px<0)px=0; if(px>479)px=479; if(py<0)py=0; if(py>271)py=271
+  printf "%d %d %d %d %d %d\n", 0, px, py, rx, ry, 1
+}
+AWK
+
 size() { set -- $(wc -c < /tmp/ev.log); echo $1; }
 
-# encerra o aplicativo e todos os processos que ele registrou (a biblioteca lib.sh grava o PID em /tmp/apppids)
-killapps() {
-  if [ -f /tmp/appid ]; then
-    kill $(cat /tmp/appid) 2> /dev/null
-  fi
-  if [ -f /tmp/apppids ]; then
-    kill $(cat /tmp/apppids) 2> /dev/null
-  fi
-}
-
 # ---------------------------------------------------------------- 1. descobre os aplicativos e grava data/appList.txt
+# (sem interpretar a saida do ls: usa a expansao de * do proprio shell; o carimbo do icone e o md5 do conteudo)
 scan_apps() {
-  ls -l "$APPS" > /tmp/ls_apps.txt 2>&1
-  ls -l "$APPS"/*/icon.raw > /tmp/ls_icons.txt 2>&1
-  awk -v apps="$APPS" '
-    function rest(  t){ t=$0; sub(/^[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +/,"",t); return t }
-    FNR==NR { if(NF>=9 && $1 ~ /^-/){ nm=rest(); if(nm ~ /\.sh$/){ sub(/\.sh$/,"",nm); sh[nm]=1 } } next }
-    { if(NF>=9 && $1 ~ /^-/){ p=rest(); sub(apps "/","",p); sub(/\/icon\.raw$/,"",p); isz[p]=$5; st[p]=$6 "_" $7 "_" $8 } }
-    END{ for(n in sh){ s=(n in isz)?isz[n]:0; t=(n in isz)?st[n]:"-"; print n "|" apps "/" n ".sh|" apps "/" n "/icon.raw|" s "|" t } }
-  ' /tmp/ls_apps.txt /tmp/ls_icons.txt | sort > /tmp/appList.new
-  { echo "# nome|script|icone|tamanho_do_icone|carimbo_do_icone  (gerado pelo ttn a cada inicializacao)"; cat /tmp/appList.new; } > /tmp/appList.out
-  if cmp /tmp/appList.out $DATA/appList.txt > /dev/null 2>&1; then
+  : > /tmp/appList.new
+  NAPP=0
+  ls "$APPS" 2> /dev/null | sed -n 's/\.[sS][hH]$//p' > /tmp/app_names.txt
+  while read NAME; do
+    case "$NAME" in
+      ''|.*|*[!A-Za-z0-9_.-]*) log "app ignorado (nome invalido; use so letras, numeros, _ - .): $NAME"; continue ;;
+      [Oo][Rr][Ii][Gg][Ii][Nn][Aa][Ll]) log "app ignorado (nome reservado): $NAME"; continue ;;
+    esac
+    F=""
+    if [ -f "$APPS/$NAME.sh" ]; then F=$APPS/$NAME.sh; elif [ -f "$APPS/$NAME.SH" ]; then F=$APPS/$NAME.SH; fi
+    case "$F" in '') log "app ignorado (nao e um arquivo): $NAME"; continue ;; esac
+    if [ ! -s "$F" ]; then log "app ignorado (script vazio): $NAME"; continue; fi
+    NAPP=$((NAPP + 1))
+    if [ $NAPP -gt $MAXAPPS ]; then log "app ignorado (limite de $MAXAPPS aplicativos): $NAME"; continue; fi
+    ICON=$APPS/$NAME/icon.raw
+    ISZ=0
+    STAMP=-
+    if [ -f "$ICON" ]; then
+      set -- $(wc -c < "$ICON")
+      ISZ=$1
+      case "$ISZ" in
+        12800) set -- $(md5sum < "$ICON"); STAMP=$1 ;;
+      esac
+    fi
+    echo "$NAME|$F|$ICON|$ISZ|$STAMP" >> /tmp/appList.new
+  done < /tmp/app_names.txt
+  ls "$APPS" 2> /dev/null | sed -n 's/\.[sS][hH]\.[tT][xX][tT]$//p' > /tmp/app_txt.txt
+  while read NAME; do
+    log "arquivo ignorado: $NAME.sh.txt (o Windows escondeu a extensao? renomeie para $NAME.sh)"
+  done < /tmp/app_txt.txt
+  sort /tmp/appList.new > /tmp/appList.sorted
+  mv /tmp/appList.sorted /tmp/appList.new
+  { echo "# nome|script|icone|tamanho_do_icone|md5_do_icone  (gerado pelo ttn a cada inicializacao)"; cat /tmp/appList.new; } > /tmp/appList.out
+  if cmp /tmp/appList.out "$DATA/appList.txt" > /dev/null 2>&1; then
     log "appList.txt sem mudancas"
   else
-    cp /tmp/appList.out $DATA/appList.txt
+    cp /tmp/appList.out "$DATA/appList.txt"
     sync
     log "appList.txt atualizado"
   fi
 }
 
-# ---------------------------------------------------------------- 2. converte os icones (so quando mudam) e monta a lista da tela inicial
+# ---------------------------------------------------------------- 2. icones (icon.rows pronto > cache valido > converte) e lista da tela inicial
+# formato rows: 80 linhas de 160 bytes + \n (12880 bytes), byte 0 -> 1 e byte 10 -> 11
 prepare_entries() {
   echo "ORIGINAL|$DATA/icon_original.rows|ORIGINAL|" > /tmp/home_entries.txt
+  NAMES="|"
+  set -f
   while read LINE; do
     case "$LINE" in '#'*|'') continue ;; esac
     IFS='|'; set -- $LINE; IFS=$OLDIFS
     NAME=$1; SCRIPT=$2; ICON=$3; ISZ=$4; STAMP=$5
+    NAMES="$NAMES$NAME|"
     ROWS=$DATA/icon_default.rows
-    case "$ISZ" in
-      12800)
-        CK=$DATA/cache/icons/$NAME
-        OLD=""
-        read OLD < $CK.stamp 2> /dev/null
-        case "$OLD" in
-          "$ISZ|$STAMP") ROWS=$CK.rows ;;
-          *)
-            hexdump -v -e '160/1 "%u " "\n"' "$ICON" 2> /dev/null | awk '{ s=""; for(i=1;i<=NF;i++){ v=$i; if(v==0) v=1; else if(v==10) v=11; s=s sprintf("%c",v) } print s }' > $CK.rows.tmp
-            set -- $(wc -l < $CK.rows.tmp)
+    PRE=$APPS/$NAME/icon.rows
+    CK=$DATA/cache/icons/$NAME
+    USED=0
+    if [ -f "$PRE" ]; then
+      set -- $(wc -c < "$PRE")
+      case "$1" in
+        12880) ROWS=$PRE; USED=1 ;;
+        *) log "icon.rows com tamanho errado ($1 bytes, o certo e 12880): $NAME" ;;
+      esac
+    fi
+    if [ $USED = 0 ]; then
+      case "$ISZ" in
+        12800)
+          OLD=""
+          if [ -f "$CK.stamp" ]; then read OLD < "$CK.stamp"; fi
+          SIZE_CK=0
+          if [ -f "$CK.rows" ]; then set -- $(wc -c < "$CK.rows"); SIZE_CK=$1; fi
+          if [ "$OLD" = "$ISZ|$STAMP" ] && [ "$SIZE_CK" = 12880 ]; then
+            ROWS=$CK.rows
+          else
+            rm -f "$CK.stamp" "$CK.rows"
+            hexdump -v -e '160/1 "%u " "\n"' "$ICON" 2> /dev/null | awk '{ s=""; for(i=1;i<=NF;i++){ v=$i+0; if(v==0) v=1; else if(v==10) v=11; s=s sprintf("%c",v) } print s }' > "$CK.rows.tmp"
+            set -- $(wc -c < "$CK.rows.tmp")
             case "$1" in
-              80) mv $CK.rows.tmp $CK.rows; echo "$ISZ|$STAMP" > $CK.stamp; ROWS=$CK.rows; log "icone convertido: $NAME" ;;
-              *) rm -f $CK.rows.tmp; log "icone invalido (a conversao falhou): $NAME" ;;
-            esac ;;
-        esac ;;
-      0) ;;
-      *) log "icone com tamanho errado ($ISZ bytes, o certo e 12800): $NAME" ;;
-    esac
+              12880) mv "$CK.rows.tmp" "$CK.rows"; echo "$ISZ|$STAMP" > "$CK.stamp"; ROWS=$CK.rows; log "icone convertido no aparelho: $NAME" ;;
+              *) rm -f "$CK.rows.tmp"; log "icone invalido (a conversao falhou, saiu com $1 bytes): $NAME" ;;
+            esac
+          fi ;;
+        0) ;;
+        *) log "icone com tamanho errado ($ISZ bytes, o certo e 12800): $NAME" ;;
+      esac
+    fi
     echo "$NAME|$ROWS|$SCRIPT|$NAME" >> /tmp/home_entries.txt
   done < /tmp/appList.new
+  set +f
+  # limpa o cache de aplicativos que nao existem mais
+  ls "$DATA/cache/icons" 2> /dev/null | sed -n 's/\.stamp$//p' > /tmp/cache_names.txt
+  while read CN; do
+    case "$NAMES" in
+      *"|$CN|"*) ;;
+      *) rm -f "$DATA/cache/icons/$CN.stamp" "$DATA/cache/icons/$CN.rows"; log "cache removido (app sumiu): $CN" ;;
+    esac
+  done < /tmp/cache_names.txt
 }
 
-# ---------------------------------------------------------------- 3. monta as paginas da tela inicial (em memoria)
-compose_pages() {
+# ---------------------------------------------------------------- 3. paginas da tela inicial (a 0 no boot; as outras sob demanda)
+# retorna 0 se a pagina $1 esta pronta em /tmp/home_N.raw
+ensure_page() {
+  EP=$1
+  if [ -f "/tmp/home_$EP.raw" ]; then
+    set -- $(wc -c < "/tmp/home_$EP.raw")
+    case "$1" in 261120) return 0 ;; esac
+  fi
+  awk -v page=$EP -v pages=$NPAGES -v barfile="$DATA/bar.rows" -f "$DATA/home.awk" /tmp/home_entries.txt > "/tmp/home_$EP.raw"
+  set -- $(wc -c < "/tmp/home_$EP.raw")
+  case "$1" in
+    261120) return 0 ;;
+  esac
+  log "pagina $EP com tamanho errado ($1 bytes)"
+  rm -f "/tmp/home_$EP.raw"
+  return 1
+}
+
+# todo o preparo roda num processo a parte, vigiado por tempo (PREPMAX)
+prepare_all() {
+  scan_apps
+  prepare_entries
   set -- $(wc -l < /tmp/home_entries.txt)
   NENT=$1
   NPAGES=$(( (NENT + 7) / 8 ))
-  p=0
-  while :; do
-    case $p in $NPAGES) break ;; esac
-    awk -v page=$p -v pages=$NPAGES -v barfile=$DATA/bar.rows -f $DATA/home.awk /tmp/home_entries.txt > /tmp/home_$p.raw
-    set -- $(wc -c < /tmp/home_$p.raw)
-    case "$1" in 261120) ;; *) log "pagina $p com tamanho errado ($1); abrindo o original"; go_original ;; esac
-    p=$((p + 1))
-  done
+  echo "NENT=$NENT; NPAGES=$NPAGES" > /tmp/prep_vars
+  . /tmp/prep_vars
+  if ensure_page 0; then
+    : > /tmp/prep_ok
+  fi
 }
 
-read T0 _ < /proc/uptime
-scan_apps
-prepare_entries
-compose_pages
-read T1 _ < /proc/uptime
-log "aplicativos encontrados: $((NENT - 1)); paginas: $NPAGES; preparo de $T0 a $T1 (uptime)"
+read T0 T0R < /proc/uptime
+prepare_all &
+PP=$!
+PI=0
+while kill -0 $PP 2> /dev/null; do
+  milisleep 200 > /dev/null 2>&1
+  PI=$((PI + 1))
+  if [ $PI -ge $((PREPMAX * 5)) ]; then
+    log "preparo passou de $PREPMAX s: encerrando e abrindo o original"
+    killtree $PP
+    go_original
+  fi
+done
+wait $PP
+if [ ! -f /tmp/prep_ok ]; then
+  log "preparo falhou (ver as linhas acima); abrindo o original"
+  go_original
+fi
+. /tmp/prep_vars
+read T1 T1R < /proc/uptime
+log "aplicativos: $((NENT - 1)); paginas: $NPAGES; preparo de $T0 a $T1 (uptime)"
 
 # ---------------------------------------------------------------- 4. toque
-lw_tap() {
+# espera o dedo soltar (tamanho do registro estavel por 4 leituras) e zera o registro
+# (mais conservador que o do lw_tap: 6 leituras iguais com pausa de 30 ms, para nunca confundir o dedo parado com "soltou")
+settle() {
+  prev=-1; same=0
   while :; do
-    case "$SIM" in
-      ?*) read SX SY <&3 || exit 0; : > /tmp/act; break ;;
-    esac
-    S0=$(size)
+    cur=$(size)
+    case $cur in $prev) same=$((same + 1)) ;; *) same=0 ;; esac
+    prev=$cur
+    case $same in 6) break ;; esac
+    milisleep 30 > /dev/null 2>&1
+  done
+  : > /tmp/ev.log
+}
+
+# toque normal: espera o dedo soltar e decodifica as amostras do meio (metodo testado no aparelho)
+lw_tap() {
+  FAILS=0
+  while :; do
+    : > /tmp/ev.log
+    S0=0
     dd if=$EV of=/dev/null bs=16 count=1 2> /dev/null
+    DRC=$?
+    case $DRC in
+      0) FAILS=0 ;;
+      *) FAILS=$((FAILS + 1)); log "falha ao ler $EV (codigo $DRC)"; case $FAILS in 5) log "toque indisponivel: abrindo o original"; exit 0 ;; esac; sleep 1; continue ;;
+    esac
     : > /tmp/act
     prev=-1; same=0
     while :; do
@@ -165,34 +377,81 @@ lw_tap() {
   done
 }
 
+# toque rapido (FASTTAP=1): responde ao primeiro pacote, sem esperar soltar (~0,22 s em vez de ~0,77 s)
+# precisa que o dedo ja esteja solto ao chamar (o settle() cuida disso depois de cada toque)
+lw_tap_fast() {
+  FAILS=0
+  while :; do
+    dd if=$EV of=/tmp/ev4.bin bs=16 count=4 2> /dev/null
+    DRC=$?
+    case $DRC in
+      0) FAILS=0 ;;
+      *) FAILS=$((FAILS + 1)); log "falha ao ler $EV (codigo $DRC)"; case $FAILS in 5) log "toque indisponivel: abrindo o original"; exit 0 ;; esac; sleep 1; continue ;;
+    esac
+    : > /tmp/act
+    R=$(hexdump -v /tmp/ev4.bin | awk -f /tmp/fast.awk)
+    set -- $R
+    case "$6" in 0) continue ;; esac
+    SX=$2; SY=$3
+    break
+  done
+}
+
+# volta o brilho e a pagina da tela ao normal (o aplicativo pode ter mexido)
+restore_screen() {
+  CURPAN=""
+  if [ -r "$FSYS/pan" ]; then read CURPAN < "$FSYS/pan"; fi
+  case "$CURPAN" in 0,0) ;; *) echo "0,0" > "$FSYS/pan" 2> /dev/null; log "pan restaurado (estava em $CURPAN)" ;; esac
+  case "$ORIGBR" in
+    ?*) CURBR=""
+        if [ -r "$BL/brightness" ]; then read CURBR < "$BL/brightness"; fi
+        case "$CURBR" in "$ORIGBR") ;; *) echo "$ORIGBR" > "$BL/brightness" 2> /dev/null; log "brilho restaurado (estava em $CURBR)" ;; esac ;;
+  esac
+}
+
 run_app() { # $1 = script, $2 = nome
   APPDIR=$APPS/$2
   export APPDIR DATA SD
   : > /tmp/busy
-  rm -f /tmp/apppids
-  sh "$1" &
+  rm -f /tmp/apppids /tmp/app_err.txt
+  # copia sem CR (scripts salvos no Windows) para nao quebrar o sh do aparelho
+  tr -d '\015' < "$1" > /tmp/app_run.sh
+  read AT0 AT0R < /proc/uptime
+  sh /tmp/app_run.sh 2> /tmp/app_err.txt &
   echo $! > /tmp/appid
   wait $!
+  ARC=$?
+  read AT1 AT1R < /proc/uptime
+  killapps
   rm -f /tmp/appid /tmp/apppids /tmp/busy
+  log "app encerrado: $2 (codigo $ARC, de $AT0 a $AT1)"
+  if [ -s /tmp/app_err.txt ]; then
+    { echo "== $2 (codigo $ARC, uptime $AT1)"; tail -n 20 /tmp/app_err.txt; } >> "$OUT/app_err.txt"
+    log "o app $2 escreveu mensagens de erro em launcher_log/app_err.txt"
+  fi
+  restore_screen
+  settle
   : > /tmp/act
-  log "app encerrado: $2 $(date)"
 }
 
 loop() {
   : > /tmp/ev.log
-  cat $EV >> /tmp/ev.log 2> $OUT/ev_erro.txt &
+  cat $EV >> /tmp/ev.log 2> "$OUT/ev_erro.txt" &
   CATPID=$!
   PAGE=0
   cat /tmp/home_$PAGE.raw > $FB
+  rm -f "$DATA/boot_pending"
+  log "tela inicial desenhada"
   while true; do
-    lw_tap
+    case $FASTTAP in 1) lw_tap_fast ;; *) lw_tap ;; esac
+    case $DEBUG in 1) echo "[$(read U R < /proc/uptime; echo $U)] toque ($SX,$SY)" >> "$OUT/taps.txt" ;; esac
     case $((SY >= 224)) in
       1)
         case $((SX < 120)) in
-          1) case $((PAGE > 0)) in 1) PAGE=$((PAGE - 1)); cat /tmp/home_$PAGE.raw > $FB ;; esac ;;
+          1) case $((PAGE > 0)) in 1) PAGE=$((PAGE - 1)); ensure_page $PAGE || exit 0; cat /tmp/home_$PAGE.raw > $FB ;; esac ;;
         esac
         case $((SX >= 360)) in
-          1) case $((PAGE + 1 < NPAGES)) in 1) PAGE=$((PAGE + 1)); cat /tmp/home_$PAGE.raw > $FB ;; esac ;;
+          1) case $((PAGE + 1 < NPAGES)) in 1) PAGE=$((PAGE + 1)); ensure_page $PAGE || exit 0; cat /tmp/home_$PAGE.raw > $FB ;; esac ;;
         esac ;;
       *)
         IDX=$((PAGE * 8 + (SY / 112) * 4 + SX / 120 + 1))
@@ -200,36 +459,42 @@ loop() {
           1)
             SCRIPT=$(awk -F'|' -v n=$IDX 'NR==n{print $3}' /tmp/home_entries.txt)
             ANAME=$(awk -F'|' -v n=$IDX 'NR==n{print $4}' /tmp/home_entries.txt)
-            echo "$(date) toque ($SX,$SY) item $IDX: $ANAME $SCRIPT" >> $OUT/taps.txt
+            case "$ANAME" in '') ANAME=ORIGINAL ;; esac
+            log "toque ($SX,$SY) item $IDX: $ANAME"
             case "$SCRIPT" in
               ORIGINAL) break ;;
               *) run_app "$SCRIPT" "$ANAME"; cat /tmp/home_$PAGE.raw > $FB ;;
             esac ;;
         esac ;;
     esac
+    case $FASTTAP in 1) settle ;; esac
   done
   kill $CATPID 2> /dev/null
 }
 
-rm -f $OUT/taps.txt
+rm -f "$OUT/taps.txt"
 loop &
 LP=$!
 
 # vigia: sem toque por $IDLE s (ou $BUSYIDLE s dentro de um aplicativo), ou com o cabo num PC, abre o original
+# o USB e checado SEMPRE (inclusive dentro de aplicativos): sysfs a cada 1 s e dmesg a cada 5 s (reserva)
 (
   i=0
   b=0
+  t=0
   while [ $i -lt $IDLE ]; do
     sleep 1
+    t=$((t + 1))
     if [ -f /tmp/busy ]; then
       if [ -f /tmp/act ]; then
         rm -f /tmp/act
         b=0
       else
-        b=$(expr $b + 1)
+        b=$((b + 1))
       fi
       i=0
       if [ $b -ge $BUSYIDLE ]; then
+        log "vigia: aplicativo sem toque por $BUSYIDLE s"
         i=$IDLE
       fi
     elif [ -f /tmp/act ]; then
@@ -237,28 +502,33 @@ LP=$!
       i=0
       b=0
     else
-      i=$(expr $i + 1)
+      i=$((i + 1))
       b=0
     fi
-    # cabo ligado a um PC (estado USB_STATE_DEVICE): entrega para o original, que faz o disco aparecer no PC
-    if [ ! -f /tmp/busy ]; then
-      ULAST=$(dmesg | grep "usbmode:\[" | tail -1)
-      case "$ULAST" in
-        *"==> USB_STATE_DEVICE") i=$IDLE ;;
-      esac
-    fi
+    USTATE=""
+    if [ -r "$USBSYS" ]; then read USTATE < "$USBSYS"; fi
+    case "$USTATE" in
+      *USB_STATE_DEVICE*) log "vigia: cabo no PC (sysfs)"; i=$IDLE ;;
+    esac
+    case $((t % 5)) in
+      0)
+        ULAST=$(dmesg | grep "usbmode:\[" | tail -1)
+        case "$ULAST" in
+          *"==> USB_STATE_DEVICE") log "vigia: cabo no PC (dmesg)"; i=$IDLE ;;
+        esac ;;
+    esac
   done
-  echo "vigia encerrou a tela inicial: i=$i b=$b ULAST=$ULAST $(date)" >> $OUT/log.txt
+  log "vigia encerrou a tela inicial: i=$i b=$b"
   killapps
-  kill $LP 2> /dev/null
+  killtree $LP
 ) &
 WD=$!
 
 wait $LP
 kill $WD 2> /dev/null
+# encerra so o que e nosso: o aplicativo, o que ele soltou e o que o laco de toque deixou (cat, dd)
 killapps
-killall dd 2> /dev/null
-killall cat 2> /dev/null
+killtree $LP
 rm -f /tmp/busy /tmp/act /tmp/appid /tmp/apppids
-log "fim $(date)"
+log "fim"
 go_original
