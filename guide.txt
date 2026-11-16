@@ -1,0 +1,53 @@
+SISTEMA DE APLICATIVOS DO TOMTOM (launcher v11)
+
+AVISO: os aplicativos rodam como root, sem isolamento. Um aplicativo com defeito pode apagar o
+PNDNavigator ou o ttsystem e inutilizar o aparelho. Faca backup do disco antes de qualquer coisa.
+Nao apague nem renomeie PNDNavigator, ttsystem, nem a pasta bin.
+
+INSTALACAO (uma vez)
+1. Faca backup do disco do TomTom.
+2. Copie para a RAIZ do disco: o arquivo "ttn" (substitui o anterior) e as pastas "apps" e "data".
+   (A pasta "ferramentas" e para o PC; nao precisa copiar. As pastas antigas "meunav" e "launcher" nao sao mais usadas.)
+   Nao sobrescreva data/lib.sh, data/home.awk, data/bar.rows nem data/icon_*.rows da instalacao anterior:
+   a v11 usa os mesmos arquivos. Novos na v11: data/config.txt (opcional) e data/splash.raw (opcional).
+3. No PC, confira antes de copiar:  python ferramentas/validar_apps.py PASTA_DO_DISCO
+4. Ejete o disco no PC, desplugue o cabo e ligue o aparelho. A tela inicial mostra os icones.
+
+COMO INSTALAR UM APLICATIVO NOVO
+- Copie para a pasta apps:  NOME.sh  e a pasta NOME  (com um icon.raw dentro).
+- Reinicie o aparelho. O ttn encontra o app sozinho e atualiza data/appList.txt.
+- NOME so pode ter letras, numeros, _ - e . (sem espaco, sem acento, sem "|"). Aparecem os 13 primeiros caracteres.
+  NOME nao pode ser ORIGINAL. Arquivos "NOME.sh.txt" (extensao escondida pelo Windows) sao ignorados, e o motivo vai para o log.
+- Salve o .sh com quebras de linha Unix (LF). Se vier com CRLF, o ttn remove ao executar, mas nao conte com isso.
+
+ICONE
+- apps/NOME/icon.raw: 80x80 pixels, RGB565 little-endian, exatamente 12800 bytes.
+- No PC:  python ferramentas/criar_icone.py imagem.png apps/NOME/icon.raw
+- Depois:  python ferramentas/icone_rows.py apps     (cria apps/NOME/icon.rows; o aparelho nao precisa converter, o boot fica mais rapido)
+- Sem icone, ou com tamanho errado, aparece um "?" (o motivo fica em launcher_log/log.txt).
+
+APLICATIVO (script .sh)
+- Variaveis prontas: APPDIR (pasta do app), DATA (pasta data), SD (raiz do disco).
+- Comece com:  . ${DATA:-/mnt/sdcard/data}/lib.sh   (traz "show ARQUIVO.raw" e "wait_tap", que define SX e SY).
+  Se wait_tap deixar SX=-1 (leitura falhou), ignore o toque com "continue".
+- Para voltar a tela inicial, o script termina. O launcher copia o script para /tmp antes de rodar (por isso $0 nao aponta
+  para a pasta do app: use APPDIR).
+- Sem toque por 300 s (BUSYIDLE) o launcher encerra o app. Um app longo que nao espera toque (relogio, monitor) deve
+  fazer  : > /tmp/act  de tempos em tempos para avisar que esta vivo.
+- Se o app soltar processos em segundo plano que continuem depois que ele terminar, registre os PIDs em /tmp/apppids
+  (a lib.sh faz isso para os scripts do app). O launcher encerra o app e todos os processos filhos dele.
+- O launcher restaura sozinho a pagina da tela (pan 0,0) e o brilho quando o app termina.
+- Erros do app (stderr) e o codigo de saida vao para launcher_log/app_err.txt e log.txt.
+- Esqueleto pronto no PC:  python ferramentas/criar_app.py NOME   (rode na pasta que contem "apps")
+
+AJUSTES (opcional): data/config.txt  (IDLE, BUSYIDLE, PREPMAX, MAXAPPS, FASTTAP, DEBUG; veja o proprio arquivo)
+
+SEGURANCA E RECUPERACAO
+- Sem toque por 60 s, ou com o cabo ligado a um PC (tambem com um app aberto), o ttn abre o menu original da TomTom.
+- O icone ORIGINAL (primeiro da tela) abre o menu original; para conectar ao PC use-o e confirme a pergunta.
+- Se o preparo da tela inicial travar ou passar de PREPMAX segundos, o ttn encerra o preparo e abre o original.
+- MODO SEGURO: se o aparelho for desligado ou reiniciado antes de a tela inicial aparecer, o proximo boot abre direto o
+  original (e o seguinte volta ao normal). Para forcar, crie um arquivo vazio data/safe.flag (apague-o para voltar).
+- Para desfazer tudo: apague o arquivo ttn.
+- Registros em launcher_log/: log.txt (boot atual), log.1 a log.3 (boots anteriores), app_err.txt, taps.txt (so com DEBUG=1).
+  O tempo nos registros e o uptime em segundos (o relogio do aparelho esta errado).
